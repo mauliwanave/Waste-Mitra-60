@@ -1,0 +1,232 @@
+from django.shortcuts import render, redirect, get_object_or_404
+from django.contrib import messages
+from django.http import JsonResponse, FileResponse, Http404, HttpResponse
+from django.views.generic import TemplateView, DetailView
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.renderers import JSONRenderer, BrowsableAPIRenderer
+import json
+import re
+import logging
+
+from .models import WasteClassification
+from .serializers import WasteAnalysisInputSerializer, WasteClassificationSerializer
+from .gemini_service import GeminiWasteAnalyzer
+from .pdf_report import generate_waste_classification_pdf
+
+logger = logging.getLogger(__name__)
+
+def parse_gemini_response(raw_response):
+    """
+    Parse Gemini API response that may be wrapped in markdown code blocks
+    """
+    logger.info(f"Raw response length: {len(raw_response)}")
+    logger.info(f"Raw response first 200 chars: {repr(raw_response[:200])}")
+
+    # Clean up the response
+    cleaned_response = raw_response.strip()
+
+    try:
+        # First, try to parse as raw JSON
+        return json.loads(cleaned_response)
+    except json.JSONDecodeError as e:
+        logger.info(f"Direct JSON parsing failed: {e}")
+
+        # More aggressive markdown removal
+        if '```json' in cleaned_response:
+            # Find the start of the JSON
+            start_idx = cleaned_response.find('```json') + 7
+            # Find the end of the JSON (look for closing ```)
+            end_idx = cleaned_response.rfind('```')
+
+            if start_idx < end_idx:
+                json_string = cleaned_response[start_idx:end_idx].strip()
+                logger.info(f"Extracted JSON string length: {len(json_string)}")
+                logger.info(f"Extracted JSON first 100 chars: {repr(json_string[:100])}")
+
+                try:
+                    return json.loads(json_string)
+                except json.JSONDecodeError as e2:
+                    logger.error(f"Failed to parse extracted JSON: {e2}")
+                    # Log the problematic part
+                    logger.error(f"JSON string around error: {repr(json_string[max(0, e2.pos-50):e2.pos+50])}")
+
+        # Try regex approach as fallback
+        json_match = re.search(r'```json\s*(.*?)\s*```', cleaned_response, re.DOTALL)
+        if json_match:
+            json_string = json_match.group(1).strip()
+            logger.info(f"Regex extracted JSON: {repr(json_string[:100])}")
+            try:
+                return json.loads(json_string)
+            except json.JSONDecodeError as e3:
+                logger.error(f"Regex extracted JSON parsing failed: {e3}")
+
+        # Try to find any JSON-like content
+        json_match = re.search(r'(\{.*\})', cleaned_response, re.DOTALL)
+        if json_match:
+            json_candidate = json_match.group(1)
+            logger.info(f"Found JSON candidate: {repr(json_candidate[:100])}")
+            try:
+                return json.loads(json_candidate)
+            except json.JSONDecodeError as e4:
+                logger.error(f"JSON candidate parsing failed: {e4}")
+
+        # If all else fails, save the raw response for debugging
+        logger.error(f"Complete raw response: {repr(raw_response)}")
+        raise ValueError(f"No valid JSON found in response. All parsing methods failed.")
+
+
+class HomeView(TemplateView):
+    template_name = 'waste_classifier/home.html'
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context['states'] = WasteClassification.INDIAN_STATES
+        classifications = WasteClassification.objects.all()[:6]
+        # add confidence percentages
+        for c in classifications:
+            c.confidence_percentage = round(c.confidence_score * 100, 2) if c.confidence_score else 0
+        context['recent_classifications'] = classifications
+        context['total_classifications'] = WasteClassification.objects.count()
+        return context
+
+
+class HistoryView(TemplateView):
+    template_name = 'waste_classifier/history.html'
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        classifications = WasteClassification.objects.all()
+        for c in classifications:
+            c.confidence_percentage = round(c.confidence_score * 100, 2) if c.confidence_score else 0
+        context['classifications'] = classifications
+        return context
+
+
+class ClassificationDetailView(DetailView):
+    model = WasteClassification
+    template_name = 'waste_classifier/detail.html'
+    context_object_name = 'classification'
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context['confidence_percentage'] = round(self.object.confidence_score * 100, 2) if self.object.confidence_score else 0
+        return context
+
+
+class DownloadReportView(DetailView):
+    """View to download PDF report for waste classification"""
+    model = WasteClassification
+
+    def get(self, request, *args, **kwargs):
+        try:
+            classification = self.get_object()
+
+            # Generate PDF report
+            pdf_buffer = generate_waste_classification_pdf(classification)
+
+            # Create filename
+            filename = f"waste_analysis_report_{classification.id}_{classification.created_at.strftime('%Y%m%d')}.pdf"
+
+            # Create HTTP response
+            response = FileResponse(
+                pdf_buffer,
+                as_attachment=True,
+                filename=filename,
+                content_type='application/pdf'
+            )
+
+            return response
+
+        except Exception as e:
+            logger.error(f"PDF generation error: {e}")
+            messages.error(request, "Report could not be generated. Please try again.")
+            return redirect('results', pk=self.kwargs.get('pk'))
+
+
+class WasteAnalysisAPIView(APIView):
+    """API endpoint for waste image analysis using Gemini"""
+    parser_classes = [MultiPartParser, FormParser]
+    renderer_classes = [JSONRenderer, BrowsableAPIRenderer]
+
+    def get(self, request):
+        """Return API information and upload form data for browsable API"""
+        return Response({
+            'message': 'Waste Analysis API - POST an image and state to analyze waste',
+            'endpoint': '/api/analyze/',
+            'method': 'POST',
+            'required_fields': {
+                'image': 'Image file (jpg, png, webp, bmp) - Max 10MB',
+                'state': 'Indian state code'
+            },
+            'available_states': dict(WasteClassification.INDIAN_STATES),
+            'waste_categories': [
+                {'code': choice[0], 'name': choice[1]}
+                for choice in WasteClassification.WASTE_CATEGORIES
+            ],
+            'example_curl': """
+curl -X POST http://127.0.0.1:8000/api/analyze/ \\
+  -F "image=@/path/to/image.jpg" \\
+  -F "state=MH"
+            """.strip()
+        })
+
+    def post(self, request):
+        """Process waste image analysis - Currently disabled"""
+        return Response({
+            'success': False,
+            'error': 'Analysis service is currently unavailable'
+        }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+
+class DownloadReportAPIView(APIView):
+    """API endpoint to download PDF report"""
+
+    def get(self, request, pk):
+        try:
+            classification = get_object_or_404(WasteClassification, pk=pk)
+
+            # Generate PDF report
+            pdf_buffer = generate_waste_classification_pdf(classification)
+
+            # Create filename
+            filename = f"waste_analysis_report_{classification.id}_{classification.created_at.strftime('%Y%m%d')}.pdf"
+
+            # Create HTTP response
+            response = HttpResponse(pdf_buffer.getvalue(), content_type='application/pdf')
+            response['Content-Disposition'] = f'attachment; filename="{filename}"'
+
+            return response
+
+        except Exception as e:
+            return Response({
+                'success': False,
+                'error': f'PDF generation failed: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class WasteAnalysisView(TemplateView):
+    """Traditional Django view for form submission"""
+    template_name = 'waste_classifier/analyze.html'
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context['states'] = WasteClassification.INDIAN_STATES
+        return context
+
+    def post(self, request, *args, **kwargs):
+        # AI functionality disabled - redirect back to analyze page
+        return redirect('analyze')
+
+
+class ResultsView(DetailView):
+    model = WasteClassification
+    template_name = 'waste_classifier/results.html'
+    context_object_name = 'classification'
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context['confidence_percentage'] = round(self.object.confidence_score * 100, 2) if self.object.confidence_score else 0
+        return context
