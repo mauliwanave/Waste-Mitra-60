@@ -6,6 +6,6 @@ services:
     startCommand: "gunicorn waste_management.wsgi:application"
     envVars:
       - key: PYTHON_VERSION
-        value: 3.9.0
+        value: 3.10.14
       - key: GEMINI_API_KEY
         sync: false
