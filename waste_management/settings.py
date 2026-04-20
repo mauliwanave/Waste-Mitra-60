@@ -62,7 +62,8 @@ MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
 # Gemini API Configuration
-GEMINI_API_KEY = config('GEMINI_API_KEY', default='AIzaSyDfN-p7qy7sWyGinta2RZEh0SsahPyzIQM')
+# Warning: Never hardcode API keys here. Provide them in your .env file instead.
+GEMINI_API_KEY = config('GEMINI_API_KEY', default='')
 
 # Django REST Framework settings
 REST_FRAMEWORK = {
