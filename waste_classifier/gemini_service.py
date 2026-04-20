@@ -136,10 +136,18 @@ class GeminiWasteAnalyzer:
             }
 
         except Exception as e:
-            logger.error(f"Gemini API error: {str(e)}")
+            error_msg = str(e)
+            logger.error(f"Gemini API error: {error_msg}")
+            
+            # Make API quota limit errors more user-friendly
+            if "429" in error_msg and "quota" in error_msg.lower():
+                user_msg = "Free tier quota limit reached. Please wait for 1 minute and try again, or upgrade your Google API key tier."
+            else:
+                user_msg = f'Gemini API error: {error_msg}'
+                
             return {
                 'success': False,
-                'error': f'Gemini API error: {str(e)}'
+                'error': user_msg
             }
 
     def _create_analysis_prompt(self, state_name: str, state_code: str) -> str:
